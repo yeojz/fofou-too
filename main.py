@@ -3,7 +3,7 @@ import wsgiref.handlers
 
 from google.appengine.ext import webapp
 
-from controllers.base import FofouBase, RssFeed, RssAllFeed
+from controllers.base import FofouBase, RssFeed, RssAllFeed, PostDelUndel
 from controllers.forum import *
 
 
