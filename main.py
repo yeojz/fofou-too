@@ -6,10 +6,21 @@ from google.appengine.api import memcache
 from google.appengine.ext import webapp
 from google.appengine.ext import db
 from google.appengine.ext.webapp import template
-from django.utils import feedgenerator
+
 from django.template import Context, Template
+
 import logging
-from offsets import *
+
+from controllers.base import FofouBase, RssFeed, RssAllFeed
+
+from models.database import *
+
+from modules.offsets import *
+from modules.config import *
+from modules.app_function import *
+
+
+
 
 # Structure of urls:
 #
@@ -42,278 +53,10 @@ from offsets import *
 # /<forum_url>/rssall
 #    rss feed for all posts
 
-# HTTP codes
-HTTP_NOT_ACCEPTABLE = 406
-HTTP_NOT_FOUND = 404
 
-RSS_MEMCACHED_KEY = "rss"
 
-BANNED_IPS = {
-    "59.181.121.8" : 1,
-    "62.162.98.194" : 1,
-    #"127.0.0.1" : 1,
-}
 
-class FofouUser(db.Model):
-  # according to docs UserProperty() cannot be optional, so for anon users
-  # we set it to value returned by anonUser() function
-  # user is uniquely identified by either user property (if not equal to
-  # anonUser()) or cookie
-  user = db.UserProperty()
-  cookie = db.StringProperty()
-  # email, as entered in the post form, can be empty string
-  email = db.StringProperty()
-  # name, as entered in the post form
-  name = db.StringProperty()
-  # homepage - as entered in the post form, can be empty string
-  homepage = db.StringProperty()
-  # value of 'remember_me' checkbox selected during most recent post
-  remember_me = db.BooleanProperty(default=True)
 
-class Forum(db.Model):
-  # Urls for forums are in the form /<urlpart>/<rest>
-  url = db.StringProperty(required=True)
-  # What we show as html <title> and as main header on the page
-  title = db.StringProperty()
-  # a tagline is below title
-  tagline = db.StringProperty()
-  # stuff to display in left sidebar
-  sidebar = db.TextProperty()
-  # if true, forum has been disabled. We don't support deletion so that
-  # forum can always be re-enabled in the future
-  is_disabled = db.BooleanProperty(default=False)
-  # just in case, when the forum was created. Not used.
-  created_on = db.DateTimeProperty(auto_now_add=True)
-  # name of the skin (must be one of SKINS)
-  skin = db.StringProperty()
-  # Google analytics code
-  analytics_code = db.StringProperty()
-  # Note: import_secret is obsolete
-  import_secret = db.StringProperty()
-
-# A forum is collection of topics
-class Topic(db.Model):
-  forum = db.Reference(Forum, required=True)
-  subject = db.StringProperty(required=True)
-  created_on = db.DateTimeProperty(auto_now_add=True)
-  # name of person who created the topic. Duplicates Post.user_name
-  # of the first post in this topic, for speed
-  created_by = db.StringProperty()
-  # just in case, not used
-  updated_on = db.DateTimeProperty(auto_now=True)
-  # True if first Post in this topic is deleted. Updated on deletion/undeletion
-  # of the post
-  is_deleted = db.BooleanProperty(default=False)
-  # ncomments is redundant but is faster than always quering count of Posts
-  ncomments = db.IntegerProperty(default=0)
-
-# A topic is a collection of posts
-class Post(db.Model):
-  topic = db.Reference(Topic, required=True)
-  forum = db.Reference(Forum, required=True)
-  created_on = db.DateTimeProperty(auto_now_add=True)
-  message = db.TextProperty(required=True)
-  sha1_digest = db.StringProperty(required=True)
-  # admin can delete/undelete posts. If first post in a topic is deleted,
-  # that means the topic is deleted as well
-  is_deleted = db.BooleanProperty(default=False)
-  # ip address from which this post has been made
-  user_ip = db.IntegerProperty(required=True)
-  user = db.Reference(FofouUser, required=True)
-  # user_name, user_email and user_homepage might be different than
-  # name/homepage/email fields in user object, since they can be changed in
-  # FofouUser
-  user_name = db.StringProperty()
-  user_email = db.StringProperty()
-  user_homepage = db.StringProperty()
-
-SKINS = ["default"]
-
-# cookie code based on http://code.google.com/p/appengine-utitlies/source/browse/trunk/utilities/session.py
-FOFOU_COOKIE = "fofou-uid"
-COOKIE_EXPIRE_TIME = 60*60*24*120 # valid for 60*60*24*120 seconds => 120 days
-
-def get_user_agent(): return os.environ['HTTP_USER_AGENT']
-def get_remote_ip(): return os.environ['REMOTE_ADDR']
-
-def ip2long(ip):
-  ip_array = ip.split('.')
-  ip_long = int(ip_array[0]) * 16777216 + int(ip_array[1]) * 65536 + int(ip_array[2]) * 256 + int(ip_array[3])
-  return ip_long
-
-def long2ip(val):
-  slist = []
-  for x in range(0,4):
-    slist.append(str(int(val >> (24 - (x * 8)) & 0xFF)))
-  return ".".join(slist)
-
-def to_unicode(val):
-  if isinstance(val, unicode): return val
-  try:
-    return unicode(val, 'latin-1')
-  except:
-    pass
-  try:
-    return unicode(val, 'ascii')
-  except:
-    pass
-  try:
-    return unicode(val, 'utf-8')
-  except:
-    raise
-
-def to_utf8(s):
-    s = to_unicode(s)
-    return s.encode("utf-8")
-
-def req_get_vals(req, names, strip=True): 
-  if strip:
-    return [req.get(name).strip() for name in names]
-  else:
-    return [req.get(name) for name in names]
-
-def get_inbound_cookie():
-  c = Cookie.SimpleCookie()
-  cstr = os.environ.get('HTTP_COOKIE', '')
-  c.load(cstr)
-  return c
-
-def new_user_id():
-  sid = sha.new(repr(time.time())).hexdigest()
-  return sid
-
-def valid_user_cookie(c):
-  # cookie should always be a hex-encoded sha1 checksum
-  if len(c) != 40:
-    return False
-  # TODO: check that user with that cookie exists, the way appengine-utilities does
-  return True
-
-g_anonUser = None
-def anonUser():
-  global g_anonUser
-  if None == g_anonUser:
-    g_anonUser = users.User("dummy@dummy.address.com")
-  return g_anonUser
-
-def fake_error(response):
-  response.headers['Content-Type'] = 'text/plain'
-  response.out.write('There was an error processing your request.')
-
-def valid_forum_url(url):
-  if not url:
-    return False
-  try:
-    return url == urllib.quote_plus(url)
-  except:
-    return False
-     
-# very simplistic check for <txt> being a valid e-mail address
-def valid_email(txt):
-  # allow empty strings
-  if not txt:
-    return True
-  if '@' not in txt:
-    return False
-  if '.' not in txt:
-    return False
-  return True
-
-def forum_from_url(url):
-  assert '/' == url[0]
-  path = url[1:]
-  if '/' in path:
-    (forumurl, rest) = path.split("/", 1)
-  else:
-    forumurl = path
-  return Forum.gql("WHERE url = :1", forumurl).get()
-      
-def forum_root(forum): return "/" + forum.url + "/"
-
-def forum_siteroot_tmpldir_from_url(url):
-  assert '/' == url[0]
-  path = url[1:]
-  if '/' in path:
-    (forumurl, rest) = path.split("/", 1)
-  else:
-    forumurl = path
-  forum = Forum.gql("WHERE url = :1", forumurl).get()
-  if not forum:
-    return (None, None, None)
-  siteroot = forum_root(forum)
-  skin_name = forum.skin
-  if skin_name not in SKINS:
-    skin_name = SKINS[0]
-  tmpldir = os.path.join("skins", skin_name)
-  return (forum, siteroot, tmpldir)
-
-def get_log_in_out(url):
-  user = users.get_current_user()
-  if user:
-    if users.is_current_user_admin():
-      return "Welcome admin, %s! <a href=\"%s\">Log out</a>" % (user.nickname(), users.create_logout_url(url))
-    else:
-      return "Welcome, %s! <a href=\"%s\">Log out</a>" % (user.nickname(), users.create_logout_url(url))
-  else:
-    return "<a href=\"%s\">Log in or register</a>" % users.create_login_url(url)    
-
-class FofouBase(webapp.RequestHandler):
-
-  _cookie = None
-  # returns either a FOFOU_COOKIE sent by the browser or a newly created cookie
-  def get_cookie(self):
-    if self._cookie != None:
-      return self._cookie
-    cookies = get_inbound_cookie()
-    for cookieName in cookies.keys():
-      if FOFOU_COOKIE != cookieName:
-        del cookies[cookieName]
-    if (FOFOU_COOKIE not in cookies) or not valid_user_cookie(cookies[FOFOU_COOKIE].value):
-      cookies[FOFOU_COOKIE] = new_user_id()
-      cookies[FOFOU_COOKIE]['path'] = '/'
-      cookies[FOFOU_COOKIE]['expires'] = COOKIE_EXPIRE_TIME
-    self._cookie = cookies[FOFOU_COOKIE]
-    return self._cookie
-
-  _cookie_to_set = None
-  # remember cookie so that we can send it when we render a template
-  def send_cookie(self):
-    if None == self._cookie_to_set:
-      self._cookie_to_set = self.get_cookie()
-
-  def get_cookie_val(self):
-    c = self.get_cookie()
-    return c.value
-
-  def get_fofou_user(self):
-    # get user either by google user id or cookie
-    user_id = users.get_current_user()
-    user = None
-    if user_id:
-      user = FofouUser.gql("WHERE user = :1", user_id).get()
-      #if user: logging.info("Found existing user for by user_id '%s'" % str(user_id))
-    else:
-      cookie = self.get_cookie_val()
-      if cookie:
-        user = FofouUser.gql("WHERE cookie = :1", cookie).get()
-        #if user:
-        #  logging.info("Found existing user for cookie '%s'" % cookie)
-        #else:
-        #  logging.info("Didn't find user for cookie '%s'" % cookie)
-    return user
-
-  def template_out(self, template_name, template_values):
-    self.response.headers['Content-Type'] = 'text/html'
-    if None != self._cookie_to_set:
-      # a hack extract the cookie part from the whole "Set-Cookie: val" header
-      c = str(self._cookie_to_set)
-      c = c.split(": ", 1)[1]
-      self.response.headers["Set-Cookie"] = c
-    #path = os.path.join(os.path.dirname(__file__), template_name)
-    path = template_name
-    #logging.info("tmpl: %s" % path)
-    res = template.render(path, template_values)
-    self.response.out.write(res)
 
 # responds to GET /manageforums[?forum=<key>&disable=yes&enable=yes]
 # and POST /manageforums with values from the form
@@ -437,7 +180,7 @@ class ManageForums(FofouBase):
     tvals['forums'] = forums
     if forum and not forum.tagline:
       forum.tagline = "Tagline."
-    self.template_out("manage_forums.html", tvals)
+    self.template_out(get_admin_template("manage_forums.html"), tvals)
 
 # responds to /, shows list of available forums or redirects to
 # forum management page if user is admin
@@ -454,7 +197,7 @@ class ForumList(FofouBase):
       'isadmin' : users.is_current_user_admin(),
       'log_in_out' : get_log_in_out("/")
     }
-    self.template_out("forum_list.html", tvals)
+    self.template_out(get_admin_template("forum_list.html"), tvals)
 
 # responds to GET /postdel?<post_id> and /postundel?<post_id>
 class PostDelUndel(webapp.RequestHandler):
@@ -597,84 +340,6 @@ class TopicForm(FofouBase):
     }
     tmpl = os.path.join(tmpldir, "topic.html")
     self.template_out(tmpl, tvals)
-
-# responds to /<forumurl>/rss, returns an RSS feed of recent topics
-# (taking into account only the first post in a topic - that's what
-# joelonsoftware forum rss feed does)
-class RssFeed(webapp.RequestHandler):
-
-  def get(self):
-    (forum, siteroot, tmpldir) = forum_siteroot_tmpldir_from_url(self.request.path_info)
-    if not forum or forum.is_disabled:
-      return self.error(HTTP_NOT_FOUND)
-
-    cached_feed = memcache.get(RSS_MEMCACHED_KEY)
-    if cached_feed is not None:
-      self.response.headers['Content-Type'] = 'text/xml'
-      self.response.out.write(cached_feed)
-      return
-      
-    feed = feedgenerator.Atom1Feed(
-      title = forum.title or forum.url,
-      link = siteroot + "rss",
-      description = forum.tagline)
-  
-    topics = Topic.gql("WHERE forum = :1 AND is_deleted = False ORDER BY created_on DESC", forum).fetch(25)
-    for topic in topics:
-      title = topic.subject
-      link = siteroot + "topic?id=" + str(topic.key().id())
-      first_post = Post.gql("WHERE topic = :1 ORDER BY created_on", topic).get()
-      msg = first_post.message
-      # TODO: a hack: using a full template to format message body.
-      # There must be a way to do it using straight django APIs
-      name = topic.created_by
-      if name:
-        t = Template("<strong>{{ name }}</strong>: {{ msg|striptags|escape|urlize|linebreaksbr }}")
-      else:
-        t = Template("{{ msg|striptags|escape|urlize|linebreaksbr }}")
-      c = Context({"msg": msg, "name" : name})
-      description = t.render(c)
-      pubdate = topic.created_on
-      feed.add_item(title=title, link=link, description=description, pubdate=pubdate)
-    feedtxt = feed.writeString('utf-8')
-    self.response.headers['Content-Type'] = 'text/xml'
-    self.response.out.write(feedtxt)
-    memcache.add(RSS_MEMCACHED_KEY, feedtxt)
-
-# responds to /<forumurl>/rssall, returns an RSS feed of all recent posts
-# This is good for forum admins/moderators who want to monitor all posts
-class RssAllFeed(webapp.RequestHandler):
-
-  def get(self):
-    (forum, siteroot, tmpldir) = forum_siteroot_tmpldir_from_url(self.request.path_info)
-    if not forum or forum.is_disabled:
-      return self.error(HTTP_NOT_FOUND)
-
-    feed = feedgenerator.Atom1Feed(
-      title = forum.title or forum.url,
-      link = siteroot + "rssall",
-      description = forum.tagline)
-  
-    posts = Post.gql("WHERE forum = :1 AND is_deleted = False ORDER BY created_on DESC", forum).fetch(25)
-    for post in posts:
-      topic = post.topic
-      title = topic.subject
-      link = siteroot + "topic?id=" + str(topic.key().id())
-      msg = post.message
-      # TODO: a hack: using a full template to format message body.
-      # There must be a way to do it using straight django APIs
-      name = post.user_name
-      if name:
-        t = Template("<strong>{{ name }}</strong>: {{ msg|striptags|escape|urlize|linebreaksbr }}")
-      else:
-        t = Template("{{ msg|striptags|escape|urlize|linebreaksbr }}")
-      c = Context({"msg": msg, "name" : name})
-      description = t.render(c)
-      pubdate = post.created_on
-      feed.add_item(title=title, link=link, description=description, pubdate=pubdate)
-    feedtxt = feed.writeString('utf-8')
-    self.response.headers['Content-Type'] = 'text/xml'
-    self.response.out.write(feedtxt)
 
 
 # responds to /<forumurl>/email[?post_id=<post_id>]
